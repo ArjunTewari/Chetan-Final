@@ -14,7 +14,10 @@ async function requireAdmin() {
 }
 
 export async function GET() {
-  const admin = await requireAdmin();
+  let admin;
+  try { admin = await requireAdmin(); } catch (e) {
+    return NextResponse.json({ error: (e as Error).message }, { status: 503 });
+  }
   if (!admin) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
   const svc = createServiceClient();
@@ -31,7 +34,10 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
-  const admin = await requireAdmin();
+  let admin;
+  try { admin = await requireAdmin(); } catch (e) {
+    return NextResponse.json({ error: (e as Error).message }, { status: 503 });
+  }
   if (!admin) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
   const { email, password } = await request.json();
@@ -52,7 +58,10 @@ export async function POST(request: Request) {
 }
 
 export async function DELETE(request: Request) {
-  const admin = await requireAdmin();
+  let admin;
+  try { admin = await requireAdmin(); } catch (e) {
+    return NextResponse.json({ error: (e as Error).message }, { status: 503 });
+  }
   if (!admin) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
   const { userId } = await request.json();

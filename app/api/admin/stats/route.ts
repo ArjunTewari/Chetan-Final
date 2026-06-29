@@ -32,7 +32,10 @@ async function requireAdmin() {
 }
 
 export async function GET() {
-  const admin = await requireAdmin();
+  let admin;
+  try { admin = await requireAdmin(); } catch (e) {
+    return NextResponse.json({ error: (e as Error).message }, { status: 503 });
+  }
   if (!admin) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
   const svc = createServiceClient();
