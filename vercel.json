@@ -1,0 +1,11 @@
+{
+  "framework": "nextjs",
+  "functions": {
+    "app/api/run/route.ts": {
+      "maxDuration": 300
+    },
+    "app/api/admin/clients/route.ts": {
+      "maxDuration": 30
+    }
+  }
+}
