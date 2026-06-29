@@ -10,7 +10,7 @@ const ALL_ORGS = [
 const ORG_COLORS = ['ef4444','f97316','eab308','84cc16','22c55e','10b981','14b8a6','06b6d4','3b82f6','6366f1','a855f7','ec4899','f43f5e'];
 
 type LogLine = { msg: string; level: string };
-type SectionCard = { id: string; title: string; summary: string };
+type SectionCard = { id: string; title: string; summary: string; step: number };
 type Mode = 'stepwise' | 'full';
 
 export default function RunPage() {
@@ -27,6 +27,7 @@ export default function RunPage() {
   const [logs, setLogs]             = useState<LogLine[]>([]);
   const [sections, setSections]     = useState<SectionCard[]>([]);
   const [shownCount, setShownCount] = useState(0);
+  const [runId, setRunId]           = useState<string | null>(null);
   const [done, setDone]             = useState(false);
   const [htmlB64, setHtmlB64]       = useState('');
   const [error, setError]           = useState('');
@@ -36,19 +37,21 @@ export default function RunPage() {
   const [showDownload, setShowDownload] = useState(false);
   const [showLogs, setShowLogs]       = useState(true);
 
-  const iframeRef  = useRef<HTMLIFrameElement>(null);
-  const logEndRef  = useRef<HTMLDivElement>(null);
-  const abortRef   = useRef<AbortController | null>(null);
-  const blobUrlRef = useRef<string>('');
+  const iframeRef        = useRef<HTMLIFrameElement>(null);
+  const logEndRef        = useRef<HTMLDivElement>(null);
+  const abortRef         = useRef<AbortController | null>(null);
+  const blobUrlRef       = useRef<string>('');
+  const waitingForNext   = useRef(false);
 
   // Auto-scroll logs
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
 
-  // Load iframe once htmlB64 is set
+  // Load iframe once htmlB64 is set — use TextDecoder to preserve UTF-8 characters
   useEffect(() => {
     if (!htmlB64) return;
-    const html = atob(htmlB64);
-    const blob = new Blob([html], { type: 'text/html' });
+    const bytes = Uint8Array.from(atob(htmlB64), c => c.charCodeAt(0));
+    const html  = new TextDecoder('utf-8').decode(bytes);
+    const blob  = new Blob([html], { type: 'text/html; charset=utf-8' });
     if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
     const url = URL.createObjectURL(blob);
     blobUrlRef.current = url;
@@ -62,7 +65,8 @@ export default function RunPage() {
     if (!selectedOrgs.length) { setError('Select at least one organisation'); return; }
     if (!dateFrom) { setError('Select a start date'); return; }
     setError(''); setLogs([]); setSections([]); setShownCount(0);
-    setDone(false); setHtmlB64(''); setEditMode(false); setRunning(true);
+    setRunId(null); setDone(false); setHtmlB64(''); setEditMode(false); setRunning(true);
+    waitingForNext.current = false;
 
     const capturedMode = mode;
     const ctrl = new AbortController();
@@ -72,7 +76,7 @@ export default function RunPage() {
       const res = await fetch('/api/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ orgs: selectedOrgs, dateFrom, dateTo }),
+        body: JSON.stringify({ orgs: selectedOrgs, dateFrom, dateTo, mode }),
         signal: ctrl.signal,
       });
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
@@ -94,17 +98,27 @@ export default function RunPage() {
           if (!raw) continue;
           try {
             const obj = JSON.parse(raw);
-            if (event === 'log') {
+            if (event === 'init') {
+              setRunId(obj.runId);
+            } else if (event === 'log') {
               setLogs(prev => [...prev, { msg: obj.msg, level: obj.level || 'info' }]);
             } else if (event === 'section') {
               setSections(prev => {
                 const next = [...prev, obj as SectionCard];
-                // Full mode: auto-reveal all. Stepwise: auto-reveal only the first.
-                if (capturedMode === 'full' || prev.length === 0) setShownCount(next.length);
+                // Full mode: reveal all. Stepwise: reveal first, or if user already approved (waitingForNext).
+                if (capturedMode === 'full' || prev.length === 0 || waitingForNext.current) {
+                  setShownCount(next.length);
+                  waitingForNext.current = false;
+                }
                 return next;
               });
             } else if (event === 'error') {
-              setError(obj.msg); setRunning(false);
+              if (obj.msg === 'PIPELINE_ABORTED') {
+                setLogs(prev => [...prev, { msg: 'Report generation aborted.', level: 'warn' }]);
+              } else {
+                setError(obj.msg);
+              }
+              setRunning(false);
             } else if (event === 'done') {
               setHtmlB64(obj.htmlB64); setDone(true); setRunning(false);
             }
@@ -117,12 +131,42 @@ export default function RunPage() {
     }
   };
 
-  const approveSection = () => {
-    setSections(prev => {
-      const next = Math.min(shownCount + 1, prev.length);
-      setShownCount(next);
-      return prev;
-    });
+  const abortRun = async () => {
+    if (runId) {
+      try {
+        await fetch('/api/run/abort', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ runId }),
+        });
+      } catch {}
+    }
+    abortRef.current?.abort();
+    setRunning(false);
+    setLogs(prev => [...prev, { msg: 'Report generation aborted by user.', level: 'warn' }]);
+  };
+
+  const approveSection = async () => {
+    const currentSection = sections[shownCount - 1];
+    if (!currentSection) return;
+
+    // Signal the server to continue past this section
+    if (runId) {
+      try {
+        await fetch('/api/run/approve', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ runId, step: currentSection.step }),
+        });
+      } catch {}
+    }
+
+    // If next section already buffered, reveal it; otherwise wait for SSE to deliver it
+    if (shownCount < sections.length) {
+      setShownCount(prev => prev + 1);
+    } else {
+      waitingForNext.current = true;
+    }
   };
 
   const toggleEditMode = () => {
@@ -176,7 +220,8 @@ export default function RunPage() {
 
   const resetAll = () => {
     setDone(false); setLogs([]); setSections([]); setShownCount(0);
-    setHtmlB64(''); setSelectedOrgs([]); setEditMode(false); setError('');
+    setRunId(null); setHtmlB64(''); setSelectedOrgs([]); setEditMode(false); setError('');
+    waitingForNext.current = false;
   };
 
   const signOut = async () => {
@@ -306,9 +351,23 @@ export default function RunPage() {
         {(running || sections.length > 0) && (
 
           <div>
+            {/* Abort banner shown while running */}
+            {running && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'rgba(224,92,92,.07)', border: '1px solid rgba(224,92,92,.2)', borderRadius: 8, padding: '10px 16px', marginTop: 16 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#e05c5c', animation: 'pulse 1.5s infinite', flexShrink: 0 }}/>
+                  <span style={{ fontSize: 12, color: '#8fa3b8' }}>Pipeline running — you can abort at any time</span>
+                </div>
+                <button onClick={abortRun}
+                  style={{ background: 'rgba(224,92,92,.15)', border: '1px solid rgba(224,92,92,.4)', color: '#e05c5c', borderRadius: 5, padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer', letterSpacing: '.03em' }}>
+                  ✕ Abort
+                </button>
+              </div>
+            )}
+
             {/* Collapsible log stream */}
             {logs.length > 0 && (
-              <div style={{ background: '#0a0e17', border: '1px solid #252d40', borderRadius: 8, marginTop: 16, overflow: 'hidden' }}>
+              <div style={{ background: '#0a0e17', border: '1px solid #252d40', borderRadius: 8, marginTop: 10, overflow: 'hidden' }}>
                 <button onClick={() => setShowLogs(p => !p)}
                   style={{ width: '100%', padding: '10px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer', background: 'transparent', border: 'none', color: 'inherit',
                     borderBottom: showLogs ? '1px solid #1a2030' : 'none' }}>

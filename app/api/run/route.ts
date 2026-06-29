@@ -6,6 +6,22 @@ export const maxDuration = 300;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { run: runPipeline } = require('../../../lib/pipeline');
 
+async function waitForApproval(svc: ReturnType<typeof createServiceClient>, runId: string, step: number): Promise<void> {
+  const maxMs = 180_000; // 3 min per step
+  const start = Date.now();
+  while (Date.now() - start < maxMs) {
+    const { data } = await svc
+      .from('run_approvals')
+      .select('approved_step')
+      .eq('run_id', runId)
+      .single();
+    const val = data?.approved_step ?? -1;
+    if (val === -999) throw new Error('PIPELINE_ABORTED');
+    if (val >= step) return;
+    await new Promise(r => setTimeout(r, 800));
+  }
+}
+
 export async function POST(request: Request) {
   const encoder = new TextEncoder();
 
@@ -16,13 +32,13 @@ export async function POST(request: Request) {
       };
 
       const cb = (msg: string, level?: string) => {
-        try {
-          send('log', JSON.stringify({ msg, level: level || 'info' }));
-        } catch {}
+        try { send('log', JSON.stringify({ msg, level: level || 'info' })); } catch {}
       };
 
+      const svc = createServiceClient();
+      let runId: string | null = null;
+
       try {
-        // Auth check
         const supabase = await createClient();
         const { data: { user } } = await supabase.auth.getUser();
         if (!user) {
@@ -31,8 +47,7 @@ export async function POST(request: Request) {
           return;
         }
 
-        // Parse body
-        let body: { orgs?: string[]; dateFrom?: string; dateTo?: string };
+        let body: { orgs?: string[]; dateFrom?: string; dateTo?: string; mode?: string };
         try {
           body = await request.json();
         } catch {
@@ -41,16 +56,24 @@ export async function POST(request: Request) {
           return;
         }
 
-        const { orgs, dateFrom, dateTo } = body;
+        const { orgs, dateFrom, dateTo, mode = 'full' } = body;
         if (!orgs?.length || !dateFrom || !dateTo) {
           send('error', JSON.stringify({ msg: 'orgs, dateFrom, dateTo are required' }));
           controller.close();
           return;
         }
 
+        const isStepwise = mode === 'stepwise';
+        runId = crypto.randomUUID();
+
+        // Always create run_approvals so abort works in any mode
+        await svc.from('run_approvals').insert({ run_id: runId, approved_step: 0, mode });
+        send('init', JSON.stringify({ runId, mode }));
+
         const env = {
           CLAUDE_KEY:      process.env.CLAUDE_KEY,
           APIDIRECT_KEY:   process.env.APIDIRECT_KEY,
+          SERPER_KEY:      process.env.SERPER_KEY,
           YOUTUBE_KEY:     process.env.YOUTUBE_KEY,
           OPENAI_KEY:      process.env.OPENAI_KEY,
           PERPLEXITY_KEY:  process.env.PERPLEXITY_KEY,
@@ -60,8 +83,17 @@ export async function POST(request: Request) {
         const started = Date.now();
         cb(`Starting report for: ${orgs.join(', ')} | ${dateFrom} → ${dateTo}`);
 
-        const sectionCb = (sec: { id: string; title: string; summary: string }) => {
-          try { send('section', JSON.stringify(sec)); } catch {}
+        let stepCounter = 0;
+        const sectionCb = async (sec: { id: string; title: string; summary: string }) => {
+          stepCounter++;
+          try { send('section', JSON.stringify({ ...sec, step: stepCounter })); } catch {}
+
+          // Check for abort signal before entering wait
+          const { data: abortCheck } = await svc
+            .from('run_approvals').select('approved_step').eq('run_id', runId!).single();
+          if ((abortCheck?.approved_step ?? 0) === -999) throw new Error('PIPELINE_ABORTED');
+
+          if (isStepwise) await waitForApproval(svc, runId!, stepCounter);
         };
 
         const { html, costs, articleCount } = await runPipeline(
@@ -70,16 +102,14 @@ export async function POST(request: Request) {
 
         const duration_s = Math.round((Date.now() - started) / 1000);
 
-        // Save to Supabase
         let reportId: string | null = null;
         try {
-          const svc = createServiceClient();
           const { data: logRow } = await svc.from('report_logs').insert({
-            user_id:       user.id,
-            organizations: orgs,
-            date_from:     dateFrom,
-            date_to:       dateTo,
-            html_name:     `aq-report-${new Date().toISOString().slice(0,10)}.html`,
+            user_id:         user.id,
+            organizations:   orgs,
+            date_from:       dateFrom,
+            date_to:         dateTo,
+            html_name:       `aq-report-${new Date().toISOString().slice(0,10)}.html`,
             cost_apidirect:  costs.cost_apidirect,
             cost_claude:     costs.cost_claude,
             cost_openai:     costs.cost_openai,
@@ -96,14 +126,16 @@ export async function POST(request: Request) {
           cb(`Warning: could not save report log — ${(e as Error).message}`, 'warn');
         }
 
-        // Encode HTML as base64 and send done event
         const htmlB64 = Buffer.from(html, 'utf8').toString('base64');
         send('done', JSON.stringify({ htmlB64, reportId }));
       } catch (e) {
         const msg = (e as Error).message || 'Pipeline failed';
-        try {
-          send('error', JSON.stringify({ msg }));
-        } catch {}
+        try { send('error', JSON.stringify({ msg })); } catch {}
+      } finally {
+        // Always clean up run_approvals row
+        if (runId) {
+          try { await svc.from('run_approvals').delete().eq('run_id', runId); } catch {}
+        }
       }
 
       controller.close();
