@@ -60,8 +60,12 @@ export async function POST(request: Request) {
         const started = Date.now();
         cb(`Starting report for: ${orgs.join(', ')} | ${dateFrom} → ${dateTo}`);
 
+        const sectionCb = (sec: { id: string; title: string; summary: string }) => {
+          try { send('section', JSON.stringify(sec)); } catch {}
+        };
+
         const { html, costs, articleCount } = await runPipeline(
-          orgs, dateFrom, dateTo, user.email, env, cb
+          orgs, dateFrom, dateTo, user.email, env, cb, sectionCb
         );
 
         const duration_s = Math.round((Date.now() - started) / 1000);
